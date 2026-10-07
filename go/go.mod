@@ -1,4 +1,4 @@
-module github.com/heojeongbo/peerpipe
+module github.com/heojeongbo/peerpipe/go
 
 go 1.24.0
 

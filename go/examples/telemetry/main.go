@@ -4,7 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"github.com/heojeongbo/peerpipe"
+	"github.com/heojeongbo/peerpipe/go"
 	"github.com/pion/webrtc/v4"
 	"log"
 	"net/http"
@@ -12,8 +12,8 @@ import (
 )
 
 func main() {
-	http.Handle("/dist/", http.StripPrefix("/dist/", http.FileServer(http.Dir("dist"))))
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "examples/telemetry/index.html") })
+	http.Handle("/dist/", http.StripPrefix("/dist/", http.FileServer(http.Dir("../ts/dist"))))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "../ts/examples/telemetry/index.html") })
 	http.HandleFunc("/offer", offer)
 	log.Fatal(http.ListenAndServe("127.0.0.1:18765", nil))
 }

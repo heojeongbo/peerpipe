@@ -9,7 +9,6 @@
   "include": [
     "src/**/*.ts",
     "test/**/*.ts",
-    "e2e/**/*.ts",
     "*.config.ts"
   ]
 }
