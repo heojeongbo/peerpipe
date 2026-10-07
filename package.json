@@ -1,0 +1,39 @@
+{
+  "name": "@heojeongbo/peerpipe",
+  "version": "0.1.0",
+  "description": "WebRTC data pipelines for Go and the browser.",
+  "type": "module",
+  "license": "MIT",
+  "author": "heojungbo <heojungbo@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/heojeongbo/peerpipe.git"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "type:check": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "e2e": "playwright test",
+    "prepublishOnly": "npm run type:check && npm test && npm run build"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "@playwright/test": "1.60.0"
+  }
+}

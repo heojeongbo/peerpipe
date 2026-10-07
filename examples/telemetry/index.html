@@ -1,0 +1,29 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Peerpipe telemetry</title>
+<button id="connect">Connect</button><button id="close">Close</button><output id="state">idle</output><output id="count">0</output>
+<script type="module">
+import { WebRTC } from "/dist/index.js";
+let peer, count=0;
+document.querySelector("#connect").onclick=async()=>{
+ peer?.close();count=0;
+ document.querySelector("#count").textContent="0";
+ peer=WebRTC.create({}, {
+  onConnectionStateChange:s=>document.querySelector("#state").textContent=s.connectionState,
+  onDataChannel:channel=>{
+   channel.binaryType="arraybuffer";
+   let chain=Promise.resolve();
+   channel.onmessage=e=>{chain=chain.then(async()=>{
+    const stream=new Blob([e.data]).stream().pipeThrough(new DecompressionStream("deflate"));
+    const sample=JSON.parse(await new Response(stream).text());
+    if(sample.sequence!==count) throw new Error(`out of order: ${sample.sequence}, expected ${count}`);
+    document.querySelector("#count").textContent=String(++count);
+   }).catch(e=>{document.querySelector("#state").textContent=e.message;});};
+  }
+ });
+ peer.createDataChannel("control");
+ const offer=await peer.createOfferWithGatheredIce();
+ const response=await fetch("/offer",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(offer)});
+ if(!response.ok)throw new Error(await response.text());
+ await peer.setRemoteDescription(await response.json());
+};
+document.querySelector("#close").onclick=()=>{peer?.close();document.querySelector("#state").textContent="closed";};
+</script></html>
