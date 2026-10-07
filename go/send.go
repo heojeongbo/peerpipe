@@ -1,5 +1,14 @@
 package peerpipe
 
+import "context"
+
+// SendFunc chooses when to send or discard an encoded payload. It returns the
+// same outcomes as TrySend. Calls are serialized per pump, after compression.
+// A blocking implementation must stop when ctx is canceled. Do not retain the
+// payload after returning, reenter push, or wait for Channel.Done from here.
+// limit is already resolved (nonzero); a custom policy may choose not to use it.
+type SendFunc func(ctx context.Context, dc BufferedSender, payload []byte, limit uint64) (sent bool, err error)
+
 // DefaultMaxBufferedAmount bounds queued telemetry to approximately one MiB.
 const DefaultMaxBufferedAmount uint64 = 1 << 20
 

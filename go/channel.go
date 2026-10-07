@@ -33,11 +33,13 @@ const (
 type Policy struct {
 	// MaxBufferedAmount is the queued-byte threshold above which a new payload
 	// is dropped, even on reliable channels. Zero uses DefaultMaxBufferedAmount.
-	// The check is best-effort: one payload may cross the threshold.
+	// The default check is best-effort: one payload may cross the threshold.
+	// A custom Options.Send chooses how to interpret this limit.
 	MaxBufferedAmount uint64
 
 	// Reliable sends ordered and fully reliable. Otherwise the channel is
 	// unordered with no retransmit, right for latest-wins telemetry.
+	// Used only by Open when Options.DataChannelInit is nil.
 	Reliable bool
 
 	// Compress zlib-compresses each payload.
@@ -89,6 +91,8 @@ type pump[T any] struct {
 	// becomes of it.
 	release func(T)
 	onDrop  func(int)
+	onError func(string, error)
+	send    SendFunc
 
 	in     <-chan T // non-nil for a Pulled Source
 	opened chan struct{}
@@ -107,6 +111,7 @@ type pump[T any] struct {
 	droppedPayloads uint64
 	stopReason      string
 	halted          sync.Once
+	openOnce        sync.Once
 	sent            sync.Once
 	// The first failure of each kind is logged; one kind must not hide another.
 	failedEncode, failedCompress, failedSend sync.Once
@@ -122,11 +127,23 @@ type Options[T any] struct {
 	Encode  func(T, func([]byte)) error
 	Release func(T)
 	Logger  *slog.Logger
-	// OnDrop reports each encoded payload discarded by the congestion limit,
+	// DataChannelInit overrides the entire Reliable preset with native Pion
+	// options. An empty struct uses Pion defaults (ordered, fully reliable).
+	// Only Open accepts it; Attach uses the existing channel's configuration.
+	DataChannelInit *webrtc.DataChannelInit
+	// Send replaces the default TrySend congestion policy. It runs synchronously
+	// and must honor context cancellation if it waits or retries.
+	Send SendFunc
+	// OnDrop reports each encoded payload discarded by the send policy,
 	// with its size after compression. It does not report pre-open source values.
 	// It runs synchronously with Encode; it must return and must not reenter the
 	// source's push callback or wait for Done. Nil disables this notification.
 	OnDrop func(bytes int)
+	// OnError reports runtime encode, compress, send, and cleanup failures.
+	// Initialization failures are returned instead. Like OnDrop, it must not
+	// reenter push or wait for Done. Each operation reports at most once per value;
+	// logs remain rate-limited even when this callback observes repeated failures.
+	OnError func(operation string, err error)
 }
 
 // Channel owns one data channel and its subscription, never the peer connection.
@@ -136,10 +153,15 @@ type Channel struct {
 	DataChannel *webrtc.DataChannel
 	cancel      context.CancelFunc
 	done        chan struct{}
+	opened      <-chan struct{}
 }
 
 func (c *Channel) Close() error          { c.cancel(); return c.DataChannel.Close() }
 func (c *Channel) Done() <-chan struct{} { return c.done }
+
+// Opened closes when the pump observes an open channel. Select with Done too:
+// a canceled or failed channel may never open. This does not acknowledge delivery.
+func (c *Channel) Opened() <-chan struct{} { return c.opened }
 
 // Open subscribes before creating a channel, preserving BeforeOpen policy even
 // for sources that push synchronously during registration. On source failure,
@@ -147,8 +169,56 @@ func (c *Channel) Done() <-chan struct{} { return c.done }
 // a nil stop callback. Cancel ctx to stop the pump; Close also closes the channel.
 // StopOnError stops the source but leaves the channel open for its owner's cleanup.
 func Open[T any](ctx context.Context, conn *webrtc.PeerConnection, opts Options[T]) (*Channel, error) {
-	if ctx == nil || conn == nil || opts.Source == nil || opts.Encode == nil {
-		return nil, fmt.Errorf("peerpipe: context, connection, source and encoder are required")
+	if conn == nil {
+		return nil, fmt.Errorf("peerpipe: connection is required")
+	}
+	init := opts.DataChannelInit
+	if init == nil {
+		ordered, retransmits := opts.Policy.Reliable, uint16(0)
+		init = &webrtc.DataChannelInit{Ordered: &ordered}
+		if !ordered {
+			init.MaxRetransmits = &retransmits
+		}
+	}
+	return start(ctx, opts, "created", func() (*webrtc.DataChannel, error) {
+		return conn.CreateDataChannel(opts.Label, init)
+	})
+}
+
+// Attach starts an outbound pump on a local or remotely created data channel,
+// including one that is already open. On success, Channel.Close owns closing it;
+// on failure, the caller retains it unchanged. Attach requires an unused OnClose
+// slot and, for a connecting channel, an unused OnOpen slot. Do not replace these
+// handlers while attached. An already-open channel retains its existing OnOpen.
+// OnMessage, OnError and OnBufferedAmountLow remain available to the caller.
+// Detached Pion channels are not supported. Label must be empty or match dc.
+// Reliable and DataChannelInit cannot reconfigure an existing channel.
+func Attach[T any](ctx context.Context, dc *webrtc.DataChannel, opts Options[T]) (*Channel, error) {
+	if dc == nil {
+		return nil, fmt.Errorf("peerpipe: data channel is required")
+	}
+	if opts.DataChannelInit != nil || (opts.Label != "" && opts.Label != dc.Label()) {
+		return nil, fmt.Errorf("peerpipe: Attach requires matching label and no DataChannelInit")
+	}
+	usable := func() bool {
+		state := dc.ReadyState()
+		return state == webrtc.DataChannelStateConnecting || state == webrtc.DataChannelStateOpen
+	}
+	if !usable() {
+		return nil, fmt.Errorf("peerpipe: data channel is closing or closed")
+	}
+	opts.Label = dc.Label()
+	return start(ctx, opts, "attached", func() (*webrtc.DataChannel, error) {
+		if !usable() {
+			return nil, fmt.Errorf("data channel closed during subscription")
+		}
+		return dc, nil
+	})
+}
+
+func start[T any](ctx context.Context, opts Options[T], action string, acquire func() (*webrtc.DataChannel, error)) (*Channel, error) {
+	if ctx == nil || opts.Source == nil || opts.Encode == nil {
+		return nil, fmt.Errorf("peerpipe: context, source and encoder are required")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -167,7 +237,8 @@ func Open[T any](ctx context.Context, conn *webrtc.PeerConnection, opts Options[
 	logger = logger.With(slog.String("component", "peerpipe"), slog.String("label", opts.Label))
 	child, cancel := context.WithCancel(ctx)
 	p := &pump[T]{ctx: child, log: logger, policy: opts.Policy,
-		encode: opts.Encode, release: release, onDrop: opts.OnDrop, opened: make(chan struct{}),
+		encode: opts.Encode, release: release, onDrop: opts.OnDrop, onError: opts.OnError,
+		send: opts.Send, opened: make(chan struct{}),
 		closed: make(chan struct{}), halt: make(chan struct{})}
 	stop, err := opts.Source(p)
 	if err != nil {
@@ -184,42 +255,53 @@ func Open[T any](ctx context.Context, conn *webrtc.PeerConnection, opts Options[
 		cancel()
 		return nil, err
 	}
-	ordered, retransmits := false, uint16(0)
-	init := &webrtc.DataChannelInit{Ordered: &ordered, MaxRetransmits: &retransmits}
-	if opts.Policy.Reliable {
-		ordered = true
-		init.MaxRetransmits = nil
-	}
-	dc, err := conn.CreateDataChannel(opts.Label, init)
+	dc, err := acquire()
 	if err != nil {
-		logger.WarnContext(child, "create data channel failed", slog.Any("error", err))
+		logger.WarnContext(child, "acquire data channel failed", slog.Any("error", err))
 		p.finish(stop)
 		cancel()
-		return nil, fmt.Errorf("create data channel: %w", err)
+		return nil, fmt.Errorf("acquire data channel: %w", err)
 	}
 	p.dc = dc
-	ch := &Channel{DataChannel: dc, cancel: cancel, done: make(chan struct{})}
-	dc.OnOpen(p.onOpen)
+	ch := &Channel{DataChannel: dc, cancel: cancel, done: make(chan struct{}), opened: p.opened}
 	dc.OnClose(func() {
 		logger.InfoContext(child, "data channel closed")
 		close(p.closed)
+		cancel() // Unblock an in-flight custom Send before waiting for pump cleanup.
 	})
-	logger.InfoContext(child, "data channel created",
-		slog.Bool("reliable", opts.Policy.Reliable), slog.Bool("compressed", opts.Policy.Compress),
+	logger.InfoContext(child, "data channel "+action,
+		slog.Bool("ordered", dc.Ordered()), slog.String("protocol", dc.Protocol()),
+		slog.Any("max_retransmits", dc.MaxRetransmits()), slog.Any("max_packet_lifetime", dc.MaxPacketLifeTime()),
+		slog.Bool("negotiated", dc.Negotiated()), slog.Any("id", dc.ID()),
+		slog.Bool("compressed", opts.Policy.Compress), slog.Bool("custom_send", opts.Send != nil),
 		slog.Uint64("buffer_limit", opts.Policy.BufferLimit()))
+	if dc.ReadyState() == webrtc.DataChannelStateOpen {
+		// Pion resets its internal sync.Once when OnOpen is registered. Avoid
+		// replacing an already-running caller handler on an adopted open channel.
+		go p.onOpen()
+	} else {
+		dc.OnOpen(p.onOpen)
+	}
 	go func() { defer close(ch.done); defer cancel(); p.run(stop) }()
 	return ch, nil
 }
 
 func (p *pump[T]) onOpen() {
+	p.openOnce.Do(p.open)
+}
+
+func (p *pump[T]) open() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done || p.ctx.Err() != nil {
+		return
+	}
 	p.log.InfoContext(p.ctx, "data channel open")
+	close(p.opened)
 	if p.in != nil {
-		close(p.opened)
 		return
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.isOpen = true
 	if !p.flushOnOpen() {
 		p.stopPushed()
@@ -231,7 +313,7 @@ func (p *pump[T]) push(v T) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	switch {
-	case p.done:
+	case p.done || p.ctx.Err() != nil:
 		p.release(v)
 	case !p.isOpen:
 		p.beforeOpen(v)
@@ -347,9 +429,15 @@ func (p *pump[T]) flushOnOpen() bool {
 // failure ends the pump under StopOnError. p.mu must be held.
 func (p *pump[T]) deliver(v T) bool {
 	defer p.release(v)
+	if p.ctx.Err() != nil {
+		return false
+	}
 
 	var compressErr, sendErr error
 	encodeErr := p.encode(v, func(b []byte) {
+		if p.ctx.Err() != nil {
+			return
+		}
 		if p.policy.StopOnError && (compressErr != nil || sendErr != nil) {
 			return
 		}
@@ -362,7 +450,13 @@ func (p *pump[T]) deliver(v T) bool {
 			}
 			out = deflated
 		}
-		sent, err := TrySend(p.dc, out, p.policy.BufferLimit())
+		var sent bool
+		var err error
+		if p.send == nil {
+			sent, err = TrySend(p.dc, out, p.policy.BufferLimit())
+		} else {
+			sent, err = p.send(p.ctx, p.dc, out, p.policy.BufferLimit())
+		}
 		if err != nil {
 			sendErr = err
 			return
@@ -370,7 +464,11 @@ func (p *pump[T]) deliver(v T) bool {
 		if !sent {
 			p.droppedPayloads++
 			if p.droppedPayloads == 1 {
-				p.log.WarnContext(p.ctx, "data channel congested; dropping payloads",
+				message := "data channel congested; dropping payloads"
+				if p.send != nil {
+					message = "data channel send policy dropped payloads"
+				}
+				p.log.WarnContext(p.ctx, message,
 					slog.Int("bytes", len(out)), slog.Uint64("buffer_limit", p.policy.BufferLimit()))
 			}
 			if p.onDrop != nil {
@@ -383,6 +481,7 @@ func (p *pump[T]) deliver(v T) bool {
 			p.log.InfoContext(p.ctx, "data channel first send ok", slog.Int("bytes", len(out)))
 		})
 	})
+	keepGoing := true
 	for _, f := range []struct {
 		what string
 		err  error
@@ -395,18 +494,22 @@ func (p *pump[T]) deliver(v T) bool {
 		if f.err == nil {
 			continue
 		}
+		if p.onError != nil {
+			p.onError(f.what, f.err)
+		}
 		if p.policy.StopOnError {
 			p.stopReason = f.what + " failed"
 			p.log.WarnContext(p.ctx, "data channel failure; stopping source",
 				slog.String("operation", f.what), slog.Any("error", f.err))
-			return false
+			keepGoing = false
+			continue
 		}
 		f.once.Do(func() {
 			p.log.WarnContext(p.ctx, "data channel failure; skipping value",
 				slog.String("operation", f.what), slog.Any("error", f.err))
 		})
 	}
-	return true
+	return keepGoing && p.ctx.Err() == nil
 }
 
 // finish stops the Source and lets go of what the pump still holds.
@@ -439,6 +542,9 @@ func (p *pump[T]) finish(stop func() error) {
 
 	if err := stop(); err != nil {
 		p.log.WarnContext(p.ctx, "close subscription failed", slog.Any("error", err))
+		if p.onError != nil {
+			p.onError("cleanup", err)
+		}
 	}
 	p.log.InfoContext(p.ctx, "data channel pump stopped",
 		slog.String("reason", reason), slog.Uint64("sent_payloads", sent),

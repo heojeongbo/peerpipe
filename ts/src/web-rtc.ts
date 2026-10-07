@@ -15,6 +15,8 @@ export class WebRTC {
 	protected pc: RTCPeerConnection;
 	protected callbacks: WebRTCCallbacks;
 	private dataChannels: Map<string, RTCDataChannel> = new Map();
+	private channelListeners = new Map<RTCDataChannel, () => void>();
+	private peerListeners: Array<() => void> = [];
 	private makingOffer = false;
 	private readonly logger: Logger;
 	private closed = false;
@@ -25,18 +27,27 @@ export class WebRTC {
 		return new WebRTC(config, callbacks);
 	}
 
+	/** Native media, stats, ICE restart, and configuration APIs. Close via this wrapper. */
+	get peerConnection(): RTCPeerConnection {
+		return this.pc;
+	}
+
 	private constructor(config?: WebRTCConfig, callbacks?: WebRTCCallbacks) {
 		this.callbacks = callbacks || {};
 
-		const { logger, transceivers, ...rtcConfig } = config ?? {};
+		const { logger, transceivers, peerConnectionFactory, ...rtcConfig } =
+			config ?? {};
 		this.logger = logger ?? { info() {}, warn() {} };
-		this.pc = new RTCPeerConnection(rtcConfig);
+		this.pc = peerConnectionFactory
+			? peerConnectionFactory(rtcConfig)
+			: new RTCPeerConnection(rtcConfig);
 		try {
 			for (const entry of transceivers ?? []) {
 				this.pc.addTransceiver(entry.kind, entry.init);
 			}
 			this.setupPeerConnectionListeners();
 		} catch (error) {
+			for (const detach of this.peerListeners) detach();
 			this.pc.close();
 			this.logger.warn("[WebRTC] create:failed", { error });
 			throw error;
@@ -49,38 +60,56 @@ export class WebRTC {
 	}
 
 	private setupPeerConnectionListeners(): void {
-		this.pc.onnegotiationneeded = () => {
+		this.listen("negotiationneeded", () => {
 			this.logger.info("[WebRTC] onnegotiationneeded", {
 				...this.getConnectionState(),
 				makingOffer: this.makingOffer,
 				readyForOffer: this.isReadyForOffer(),
 			});
-		};
+			this.callbacks.onNegotiationNeeded?.();
+		});
 
-		this.pc.onicecandidate = (event) => {
+		this.listen("icecandidate", (event) => {
 			if (event.candidate) {
 				this.callbacks.onIceCandidate?.(event.candidate);
 			}
-		};
+		});
+		this.listen("icegatheringstatechange", () => {
+			this.callbacks.onIceGatheringStateChange?.(this.pc.iceGatheringState);
+		});
+		this.listen("icecandidateerror", (event) => {
+			this.logger.warn("[WebRTC] iceCandidate:error", {
+				errorCode: event.errorCode,
+			});
+			this.callbacks.onIceCandidateError?.(event);
+		});
 
-		this.pc.onconnectionstatechange = () => {
+		this.listen("connectionstatechange", () => {
 			this.logger.info(
 				"[WebRTC] connectionStateChange",
 				this.getConnectionState(),
 			);
 			this.callbacks.onConnectionStateChange?.(this.getConnectionState());
-		};
+		});
 
-		this.pc.ontrack = (event) => {
+		this.listen("track", (event) => {
 			this.callbacks.onTrack?.(event);
-		};
+		});
 
-		this.pc.ondatachannel = (event) => {
+		this.listen("datachannel", (event) => {
 			const channel = event.channel;
 			this.setupDataChannelListeners(channel);
 			this.dataChannels.set(channel.label, channel);
 			this.callbacks.onDataChannel?.(channel);
-		};
+		});
+	}
+
+	private listen<K extends keyof RTCPeerConnectionEventMap>(
+		type: K,
+		listener: (event: RTCPeerConnectionEventMap[K]) => void,
+	): void {
+		this.pc.addEventListener(type, listener);
+		this.peerListeners.push(() => this.pc.removeEventListener(type, listener));
 	}
 
 	private setupDataChannelListeners(channel: RTCDataChannel): void {
@@ -91,11 +120,15 @@ export class WebRTC {
 			});
 			this.callbacks.onDataChannelOpen?.(channel);
 		};
-		const onClose = () => {
+		const detach = () => {
 			channel.removeEventListener("open", onOpen);
 			channel.removeEventListener("close", onClose);
 			channel.removeEventListener("message", onMessage);
 			channel.removeEventListener("error", onError);
+			this.channelListeners.delete(channel);
+		};
+		const onClose = () => {
+			detach();
 			// A label can be opened again while its previous channel is still
 			// closing (a subscription reopened after cancellation). Deleting by label
 			// alone let that late close drop the live replacement, so
@@ -127,6 +160,7 @@ export class WebRTC {
 		channel.addEventListener("close", onClose);
 		channel.addEventListener("message", onMessage);
 		channel.addEventListener("error", onError);
+		this.channelListeners.set(channel, detach);
 	}
 
 	createDataChannel(
@@ -321,9 +355,12 @@ export class WebRTC {
 		this.closed = true;
 		for (const cancel of this.iceWaiters) cancel();
 		this.iceWaiters.clear();
-		for (const [_, dc] of this.dataChannels) {
+		for (const detach of this.peerListeners) detach();
+		this.peerListeners = [];
+		for (const dc of this.channelListeners.keys()) {
 			dc.close();
 		}
+		this.channelListeners.clear();
 		this.dataChannels.clear();
 		this.pc.close();
 		this.logger.info("[WebRTC] closed", this.getConnectionState());
@@ -331,6 +368,13 @@ export class WebRTC {
 
 	getDataChannel(label: string): RTCDataChannel | undefined {
 		return this.dataChannels.get(label);
+	}
+
+	/** Snapshot of tracked channels, including multiple channels with the same label. */
+	getDataChannels(label?: string): RTCDataChannel[] {
+		return [...this.channelListeners.keys()].filter(
+			(channel) => label === undefined || channel.label === label,
+		);
 	}
 
 	private getLocalDescription(): RTCSessionDescriptionInit {

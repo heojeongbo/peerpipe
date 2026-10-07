@@ -13,7 +13,9 @@ import (
 
 func main() {
 	http.Handle("/dist/", http.StripPrefix("/dist/", http.FileServer(http.Dir("../ts/dist"))))
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.ServeFile(w, r, "../ts/examples/telemetry/index.html") })
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "../ts/examples/telemetry/index.html")
+	})
 	http.HandleFunc("/offer", offer)
 	log.Fatal(http.ListenAndServe("127.0.0.1:18765", nil))
 }
@@ -46,6 +48,28 @@ func offer(w http.ResponseWriter, r *http.Request) {
 		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed || s == webrtc.PeerConnectionStateDisconnected {
 			cancel()
 		}
+	})
+	// The remote application can create its own channel with its own protocol.
+	// This demo opts into echo only for that protocol; other channels are ignored.
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if dc.Protocol() != "peerpipe.echo" {
+			return
+		}
+		var push func([]byte)
+		_, err := peerpipe.Attach(ctx, dc, peerpipe.Options[[]byte]{
+			Policy: peerpipe.Policy{BeforeOpen: peerpipe.HoldLatestBeforeOpen, StopOnError: true},
+			Source: peerpipe.Pushed(func(f func([]byte)) (func() error, error) {
+				push = f
+				return nil, nil
+			}),
+			Encode: func(value []byte, emit func([]byte)) error { emit(value); return nil },
+		})
+		if err != nil {
+			log.Printf("attach echo: %v", err)
+			dc.Close()
+			return
+		}
+		dc.OnMessage(func(message webrtc.DataChannelMessage) { push(message.Data) })
 	})
 	_, err = peerpipe.Open(ctx, pc, peerpipe.Options[int]{Label: "telemetry", Policy: peerpipe.Policy{Reliable: true, Compress: true, BeforeOpen: peerpipe.WaitBeforeOpen},
 		Source: peerpipe.Pulled(func() (<-chan int, func() error, error) {

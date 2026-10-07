@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WebRTC } from "../src/index";
 
-class FakeRTCPeerConnection {
+class FakeRTCPeerConnection extends EventTarget {
 	connectionState: RTCPeerConnectionState = "new";
 	iceConnectionState: RTCIceConnectionState = "new";
 	iceGatheringState: RTCIceGatheringState = "new";
@@ -14,24 +14,13 @@ class FakeRTCPeerConnection {
 	ontrack: ((event: RTCTrackEvent) => void) | null = null;
 	ondatachannel: ((event: RTCDataChannelEvent) => void) | null = null;
 
-	private listeners = new Map<string, Set<() => void>>();
-
 	addTransceiver() {}
 
-	addEventListener(event: string, listener: () => void) {
-		const listeners = this.listeners.get(event) ?? new Set<() => void>();
-		listeners.add(listener);
-		this.listeners.set(event, listeners);
-	}
-
-	removeEventListener(event: string, listener: () => void) {
-		this.listeners.get(event)?.delete(listener);
-	}
-
-	dispatch(event: string) {
-		for (const listener of this.listeners.get(event) ?? []) {
-			listener();
-		}
+	dispatch(type: string, detail: object = {}) {
+		const event = Object.assign(new Event(type), detail);
+		this.dispatchEvent(event);
+		const handler = Reflect.get(this, `on${type}`);
+		if (typeof handler === "function") handler(event);
 	}
 
 	async createAnswer(): Promise<RTCSessionDescriptionInit> {
@@ -147,8 +136,8 @@ describe("WebRTC data channel map", () => {
 
 		const replaced = fakeDataChannel("updates");
 		const live = fakeDataChannel("updates");
-		pc.ondatachannel?.({ channel: replaced } as unknown as RTCDataChannelEvent);
-		pc.ondatachannel?.({ channel: live } as unknown as RTCDataChannelEvent);
+		pc.dispatch("datachannel", { channel: replaced });
+		pc.dispatch("datachannel", { channel: live });
 
 		replaced.close();
 
@@ -292,7 +281,7 @@ describe("transport contracts", () => {
 		const peer = WebRTC.create({ logger }, { onError: old });
 		const pc = (peer as unknown as { pc: FakeRTCPeerConnection }).pc;
 		const channel = fakeDataChannel("updates");
-		pc.ondatachannel?.({ channel } as unknown as RTCDataChannelEvent);
+		pc.dispatch("datachannel", { channel });
 		peer.updateCallbacks({ onError });
 		const error = new Error("transport failed");
 		const event = new Event("error");
@@ -341,7 +330,7 @@ describe("transport contracts", () => {
 		);
 		const pc = (peer as unknown as { pc: FakeRTCPeerConnection }).pc;
 		const channel = fakeDataChannel("updates");
-		pc.ondatachannel?.({ channel } as unknown as RTCDataChannelEvent);
+		pc.dispatch("datachannel", { channel });
 		channel.onmessage = vi.fn();
 		channel.onclose = vi.fn();
 		channel.message("private-payload");
@@ -391,5 +380,79 @@ describe("ICE timeout validation", () => {
 		).rejects.toBeInstanceOf(RangeError);
 		expect(pc.localDescription).toBeNull();
 		peer.close();
+	});
+});
+
+describe("native API extensions", () => {
+	it("uses an injected peer, composes native events, and detaches only owned listeners", () => {
+		const pc = new FakeRTCPeerConnection();
+		const nativeNegotiation = vi.fn();
+		pc.onnegotiationneeded = nativeNegotiation;
+		const factory = vi.fn(() => pc as unknown as RTCPeerConnection);
+		const onNegotiationNeeded = vi.fn();
+		const onIceGatheringStateChange = vi.fn();
+		const onIceCandidateError = vi.fn();
+		const peer = WebRTC.create(
+			{ peerConnectionFactory: factory, bundlePolicy: "max-bundle" },
+			{ onNegotiationNeeded, onIceGatheringStateChange, onIceCandidateError },
+		);
+		expect(factory).toHaveBeenCalledWith({ bundlePolicy: "max-bundle" });
+		expect(peer.peerConnection).toBe(pc);
+		pc.dispatch("negotiationneeded");
+		expect(onNegotiationNeeded).toHaveBeenCalledTimes(1);
+		expect(nativeNegotiation).toHaveBeenCalledTimes(1);
+		pc.iceGatheringState = "complete";
+		pc.dispatch("icegatheringstatechange");
+		expect(onIceGatheringStateChange).toHaveBeenCalledWith("complete");
+		pc.dispatch("icecandidateerror", { errorCode: 701 });
+		expect(onIceCandidateError).toHaveBeenCalledWith(
+			expect.objectContaining({ errorCode: 701 }),
+		);
+		peer.close();
+		pc.dispatch("negotiationneeded");
+		pc.dispatch("icecandidateerror");
+		expect(onNegotiationNeeded).toHaveBeenCalledTimes(1);
+		expect(nativeNegotiation).toHaveBeenCalledTimes(2);
+		expect(onIceCandidateError).toHaveBeenCalledTimes(1);
+	});
+
+	it("owns injected peers on initialization failure too", () => {
+		const pc = new FakeRTCPeerConnection();
+		const close = vi.spyOn(pc, "close");
+		vi.spyOn(pc, "addTransceiver").mockImplementation(() => {
+			throw new Error("setup");
+		});
+		expect(() =>
+			WebRTC.create({
+				peerConnectionFactory: () => pc as unknown as RTCPeerConnection,
+				transceivers: [{ kind: "audio" }],
+			}),
+		).toThrow("setup");
+		expect(close).toHaveBeenCalledTimes(1);
+	});
+
+	it("enumerates duplicate labels and closes every tracked channel", () => {
+		const pc = new FakeRTCPeerConnection();
+		const onDataChannelMessage = vi.fn();
+		const peer = WebRTC.create(
+			{ peerConnectionFactory: () => pc as unknown as RTCPeerConnection },
+			{ onDataChannelMessage },
+		);
+		const first = fakeDataChannel("files");
+		const second = fakeDataChannel("files");
+		const firstClose = vi.spyOn(first, "close");
+		const secondClose = vi.spyOn(second, "close");
+		pc.dispatch("datachannel", { channel: first });
+		pc.dispatch("datachannel", { channel: second });
+		expect(peer.getDataChannels("files")).toEqual([first, second]);
+		expect(peer.getDataChannels("missing")).toEqual([]);
+		expect(peer.getDataChannel("files")).toBe(second);
+		peer.close();
+		peer.close();
+		expect(firstClose).toHaveBeenCalledTimes(1);
+		expect(secondClose).toHaveBeenCalledTimes(1);
+		expect(peer.getDataChannels()).toEqual([]);
+		first.message("late");
+		expect(onDataChannelMessage).not.toHaveBeenCalled();
 	});
 });

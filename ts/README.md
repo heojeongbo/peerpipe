@@ -55,6 +55,54 @@ partially constructed native peer before rethrowing the original error.
 The caller serializes SDP negotiation and chooses glare/reconnect policy.
 `isReadyForOffer` is a state hint, not a negotiation mutex.
 
+## Native APIs and customization
+
+`peer.peerConnection` exposes the same native `RTCPeerConnection` used by the
+wrapper. Use it for `addTrack`, `removeTrack`, `addTransceiver`, sender parameters,
+`getStats`, `setConfiguration`, or `restartIce` at any point allowed by WebRTC.
+Create managed data channels through `peer.createDataChannel(label, options)`;
+its full native options (protocol, reliability, negotiated ID) are passed through.
+`getDataChannels(label?)` returns a snapshot, including duplicate labels;
+`getDataChannel(label)` retains the latest-channel lookup for compatibility.
+
+```ts
+const peer = WebRTC.create(
+  { peerConnectionFactory: config => new RTCPeerConnection(config) },
+  {
+    onNegotiationNeeded: () => {
+      // Your signaling owner serializes this with remote offers and answers.
+      scheduleNegotiation();
+    },
+    onIceGatheringStateChange: state => {
+      if (state === "complete") signaling.sendGatheringComplete();
+    },
+    onIceCandidateError: event => reportIceFailure(event.errorCode),
+  },
+);
+peer.peerConnection.addTransceiver("audio", { direction: "recvonly" });
+const stats = await peer.peerConnection.getStats();
+peer.peerConnection.restartIce(); // Raises negotiationneeded; caller sends SDP.
+```
+
+The optional factory receives only `RTCConfiguration` and must return a **fresh,
+DOM-compatible** native peer. It enables wrappers, instrumentation, and compatible
+runtime implementations without patching globals. Ownership transfers to peerpipe,
+including closing after setup failure. It is not a borrowed-connection API.
+Call `peer.close()` for deterministic waiter cancellation and listener cleanup;
+the wrapper does not stop application-owned media tracks. Native operations that
+modify descriptions bypass wrapper negotiation flags, so prefer its SDP helpers
+when relying on `isReadyForOffer`.
+
+Peer listeners use `addEventListener` too: native property handlers and other
+listeners coexist, and closing removes only peerpipe's peer listeners. Channel
+listeners detach when their native close event arrives. All tracked channels,
+including duplicate labels, are closed; pending ICE waits reject immediately.
+Channels created directly on the native peer are not registered in wrapper
+lookups or callbacks. `onIceCandidate` keeps reporting native non-null candidates,
+including empty-string end candidates; gathering completion is observable through
+the new state callback or native `icecandidate` events. Callback return values and
+promises are not awaited; handle asynchronous failures in the application.
+
 ## Logging
 
 Supply `logger: { info, warn }` bound to the host's session or request context.
