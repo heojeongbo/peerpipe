@@ -3,3 +3,6 @@ dist/
 playwright-report/
 test-results/
 *.tgz
+
+# Local npm publishing credentials
+.npmrc

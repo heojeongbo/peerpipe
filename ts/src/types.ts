@@ -29,5 +29,6 @@ export interface WebRTCCallbacks {
 	onDataChannelMessage?: (data: unknown, channel: RTCDataChannel) => void;
 	onDataChannelOpen?: (channel: RTCDataChannel) => void;
 	onDataChannelClose?: (channel: RTCDataChannel) => void;
-	onError?: (error: Error) => void;
+	/** Native data-channel errors. Method failures throw/reject instead. */
+	onError?: (error: Error, channel?: RTCDataChannel) => void;
 }

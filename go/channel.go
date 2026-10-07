@@ -28,8 +28,8 @@ const (
 	WaitBeforeOpen
 )
 
-// Policy is how an agent-opened data channel behaves: everything each
-// channel used to decide in a pump of its own. The application chooses a policy for each stream.
+// Policy controls an outbound data channel. The application chooses a policy
+// for each stream, independently of its payload schema or source.
 type Policy struct {
 	// MaxBufferedAmount is the queued-byte threshold above which a new payload
 	// is dropped, even on reliable channels. Zero uses DefaultMaxBufferedAmount.
@@ -80,15 +80,15 @@ func Pulled[T any](subscribe func() (c <-chan T, stop func() error, err error)) 
 type pump[T any] struct {
 	ctx    context.Context
 	log    *slog.Logger
-	label  string
 	policy Policy
-	dc     *webrtc.DataChannel
+	dc     BufferedSender
 
 	// encode turns a value into zero or more payloads, handing each to emit.
 	encode func(v T, emit func([]byte)) error
 	// release is called once for every value the pump is given, whatever
 	// becomes of it.
 	release func(T)
+	onDrop  func(int)
 
 	in     <-chan T // non-nil for a Pulled Source
 	opened chan struct{}
@@ -97,14 +97,17 @@ type pump[T any] struct {
 
 	// mu serializes deliveries with the channel opening, so a held value never
 	// reaches the browser after a newer one.
-	mu      sync.Mutex
-	isOpen  bool
-	done    bool
-	held    T
-	hasHeld bool
-	dropped int
-	halted  sync.Once
-	sent    sync.Once
+	mu              sync.Mutex
+	isOpen          bool
+	done            bool
+	held            T
+	hasHeld         bool
+	dropped         int
+	sentPayloads    uint64
+	droppedPayloads uint64
+	stopReason      string
+	halted          sync.Once
+	sent            sync.Once
 	// The first failure of each kind is logged; one kind must not hide another.
 	failedEncode, failedCompress, failedSend sync.Once
 }
@@ -119,6 +122,11 @@ type Options[T any] struct {
 	Encode  func(T, func([]byte)) error
 	Release func(T)
 	Logger  *slog.Logger
+	// OnDrop reports each encoded payload discarded by the congestion limit,
+	// with its size after compression. It does not report pre-open source values.
+	// It runs synchronously with Encode; it must return and must not reenter the
+	// source's push callback or wait for Done. Nil disables this notification.
+	OnDrop func(bytes int)
 }
 
 // Channel owns one data channel and its subscription, never the peer connection.
@@ -156,18 +164,25 @@ func Open[T any](ctx context.Context, conn *webrtc.PeerConnection, opts Options[
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	logger = logger.With(slog.String("component", "peerpipe"), slog.String("label", opts.Label))
 	child, cancel := context.WithCancel(ctx)
-	p := &pump[T]{ctx: child, log: logger, label: opts.Label, policy: opts.Policy,
-		encode: opts.Encode, release: release, opened: make(chan struct{}),
+	p := &pump[T]{ctx: child, log: logger, policy: opts.Policy,
+		encode: opts.Encode, release: release, onDrop: opts.OnDrop, opened: make(chan struct{}),
 		closed: make(chan struct{}), halt: make(chan struct{})}
 	stop, err := opts.Source(p)
 	if err != nil {
+		logger.WarnContext(child, "subscribe source failed", slog.Any("error", err))
 		p.finish(func() error { return nil })
 		cancel()
-		return nil, err
+		return nil, fmt.Errorf("subscribe source: %w", err)
 	}
 	if stop == nil {
 		stop = func() error { return nil }
+	}
+	if err := child.Err(); err != nil {
+		p.finish(stop)
+		cancel()
+		return nil, err
 	}
 	ordered, retransmits := false, uint16(0)
 	init := &webrtc.DataChannelInit{Ordered: &ordered, MaxRetransmits: &retransmits}
@@ -177,6 +192,7 @@ func Open[T any](ctx context.Context, conn *webrtc.PeerConnection, opts Options[
 	}
 	dc, err := conn.CreateDataChannel(opts.Label, init)
 	if err != nil {
+		logger.WarnContext(child, "create data channel failed", slog.Any("error", err))
 		p.finish(stop)
 		cancel()
 		return nil, fmt.Errorf("create data channel: %w", err)
@@ -184,13 +200,19 @@ func Open[T any](ctx context.Context, conn *webrtc.PeerConnection, opts Options[
 	p.dc = dc
 	ch := &Channel{DataChannel: dc, cancel: cancel, done: make(chan struct{})}
 	dc.OnOpen(p.onOpen)
-	dc.OnClose(func() { close(p.closed) })
+	dc.OnClose(func() {
+		logger.InfoContext(child, "data channel closed")
+		close(p.closed)
+	})
+	logger.InfoContext(child, "data channel created",
+		slog.Bool("reliable", opts.Policy.Reliable), slog.Bool("compressed", opts.Policy.Compress),
+		slog.Uint64("buffer_limit", opts.Policy.BufferLimit()))
 	go func() { defer close(ch.done); defer cancel(); p.run(stop) }()
 	return ch, nil
 }
 
 func (p *pump[T]) onOpen() {
-	p.log.Info("data channel open", slog.String("label", p.label))
+	p.log.InfoContext(p.ctx, "data channel open")
 	if p.in != nil {
 		close(p.opened)
 		return
@@ -212,7 +234,7 @@ func (p *pump[T]) push(v T) {
 	case p.done:
 		p.release(v)
 	case !p.isOpen:
-		p.BeforeOpen(v)
+		p.beforeOpen(v)
 	case !p.deliver(v):
 		p.stopPushed()
 	}
@@ -259,7 +281,7 @@ func (p *pump[T]) run(stop func() error) {
 				return
 			}
 			p.mu.Lock()
-			p.BeforeOpen(v)
+			p.beforeOpen(v)
 			p.mu.Unlock()
 		}
 	}
@@ -292,9 +314,9 @@ func (p *pump[T]) run(stop func() error) {
 	}
 }
 
-// BeforeOpen applies the policy to a value that arrived before open. p.mu must
+// beforeOpen applies the policy to a value that arrived before open. p.mu must
 // be held.
-func (p *pump[T]) BeforeOpen(v T) {
+func (p *pump[T]) beforeOpen(v T) {
 	if p.policy.BeforeOpen != HoldLatestBeforeOpen {
 		p.dropped++
 		p.release(v)
@@ -310,8 +332,7 @@ func (p *pump[T]) BeforeOpen(v T) {
 // It returns false when that send ends the pump. p.mu must be held.
 func (p *pump[T]) flushOnOpen() bool {
 	if p.dropped > 0 {
-		p.log.Info("dropped before channel open",
-			slog.String("label", p.label), slog.Int("count", p.dropped))
+		p.log.InfoContext(p.ctx, "dropped before channel open", slog.Int("count", p.dropped))
 	}
 	if !p.hasHeld {
 		return true
@@ -329,6 +350,9 @@ func (p *pump[T]) deliver(v T) bool {
 
 	var compressErr, sendErr error
 	encodeErr := p.encode(v, func(b []byte) {
+		if p.policy.StopOnError && (compressErr != nil || sendErr != nil) {
+			return
+		}
 		out := b
 		if p.policy.Compress {
 			deflated, err := Compress(b)
@@ -338,13 +362,25 @@ func (p *pump[T]) deliver(v T) bool {
 			}
 			out = deflated
 		}
-		if err := TrySend(p.dc, out, p.policy.BufferLimit()); err != nil {
+		sent, err := TrySend(p.dc, out, p.policy.BufferLimit())
+		if err != nil {
 			sendErr = err
 			return
 		}
+		if !sent {
+			p.droppedPayloads++
+			if p.droppedPayloads == 1 {
+				p.log.WarnContext(p.ctx, "data channel congested; dropping payloads",
+					slog.Int("bytes", len(out)), slog.Uint64("buffer_limit", p.policy.BufferLimit()))
+			}
+			if p.onDrop != nil {
+				p.onDrop(len(out))
+			}
+			return
+		}
+		p.sentPayloads++
 		p.sent.Do(func() {
-			p.log.Info("data channel first send ok",
-				slog.String("label", p.label), slog.Int("bytes", len(out)))
+			p.log.InfoContext(p.ctx, "data channel first send ok", slog.Int("bytes", len(out)))
 		})
 	})
 	for _, f := range []struct {
@@ -360,13 +396,14 @@ func (p *pump[T]) deliver(v T) bool {
 			continue
 		}
 		if p.policy.StopOnError {
-			p.log.Warn("data channel pump stopped",
-				slog.String("label", p.label), slog.String("failed", f.what), slog.String("err", f.err.Error()))
+			p.stopReason = f.what + " failed"
+			p.log.WarnContext(p.ctx, "data channel failure; stopping source",
+				slog.String("operation", f.what), slog.Any("error", f.err))
 			return false
 		}
 		f.once.Do(func() {
-			p.log.Warn("data channel "+f.what+" failed; skipping",
-				slog.String("label", p.label), slog.String("err", f.err.Error()))
+			p.log.WarnContext(p.ctx, "data channel failure; skipping value",
+				slog.String("operation", f.what), slog.Any("error", f.err))
 		})
 	}
 	return true
@@ -381,10 +418,29 @@ func (p *pump[T]) finish(stop func() error) {
 		var zero T
 		p.held, p.hasHeld = zero, false
 	}
+	reason := p.stopReason
+	if reason == "" {
+		switch {
+		case p.ctx.Err() != nil:
+			reason = p.ctx.Err().Error()
+		case p.dc == nil:
+			reason = "initialization failed"
+		default:
+			select {
+			case <-p.closed:
+				reason = "channel closed"
+			default:
+				reason = "source ended"
+			}
+		}
+	}
+	sent, dropped, beforeOpen := p.sentPayloads, p.droppedPayloads, p.dropped
 	p.mu.Unlock()
 
 	if err := stop(); err != nil {
-		p.log.Warn("close subscription",
-			slog.String("label", p.label), slog.String("err", err.Error()))
+		p.log.WarnContext(p.ctx, "close subscription failed", slog.Any("error", err))
 	}
+	p.log.InfoContext(p.ctx, "data channel pump stopped",
+		slog.String("reason", reason), slog.Uint64("sent_payloads", sent),
+		slog.Uint64("dropped_payloads", dropped), slog.Int("dropped_before_open", beforeOpen))
 }

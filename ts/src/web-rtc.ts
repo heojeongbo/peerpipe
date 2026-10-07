@@ -31,11 +31,17 @@ export class WebRTC {
 		const { logger, transceivers, ...rtcConfig } = config ?? {};
 		this.logger = logger ?? { info() {}, warn() {} };
 		this.pc = new RTCPeerConnection(rtcConfig);
-		for (const entry of transceivers ?? []) {
-			this.pc.addTransceiver(entry.kind, entry.init);
+		try {
+			for (const entry of transceivers ?? []) {
+				this.pc.addTransceiver(entry.kind, entry.init);
+			}
+			this.setupPeerConnectionListeners();
+		} catch (error) {
+			this.pc.close();
+			this.logger.warn("[WebRTC] create:failed", { error });
+			throw error;
 		}
-
-		this.setupPeerConnectionListeners();
+		this.logger.info("[WebRTC] created", this.getConnectionState());
 	}
 
 	updateCallbacks(newCallbacks: Partial<WebRTCCallbacks>): void {
@@ -58,6 +64,10 @@ export class WebRTC {
 		};
 
 		this.pc.onconnectionstatechange = () => {
+			this.logger.info(
+				"[WebRTC] connectionStateChange",
+				this.getConnectionState(),
+			);
 			this.callbacks.onConnectionStateChange?.(this.getConnectionState());
 		};
 
@@ -74,10 +84,18 @@ export class WebRTC {
 	}
 
 	private setupDataChannelListeners(channel: RTCDataChannel): void {
-		channel.onopen = () => {
+		const onOpen = () => {
+			this.logger.info("[WebRTC] dataChannel:open", {
+				label: channel.label,
+				id: channel.id,
+			});
 			this.callbacks.onDataChannelOpen?.(channel);
 		};
-		channel.onclose = () => {
+		const onClose = () => {
+			channel.removeEventListener("open", onOpen);
+			channel.removeEventListener("close", onClose);
+			channel.removeEventListener("message", onMessage);
+			channel.removeEventListener("error", onError);
 			// A label can be opened again while its previous channel is still
 			// closing (a subscription reopened after cancellation). Deleting by label
 			// alone let that late close drop the live replacement, so
@@ -86,10 +104,29 @@ export class WebRTC {
 			if (this.dataChannels.get(channel.label) === channel) {
 				this.dataChannels.delete(channel.label);
 			}
+			this.logger.info("[WebRTC] dataChannel:close", {
+				label: channel.label,
+				id: channel.id,
+			});
 			this.callbacks.onDataChannelClose?.(channel);
 		};
-		channel.onmessage = (event) =>
+		const onMessage = (event: MessageEvent) =>
 			this.callbacks.onDataChannelMessage?.(event.data, channel);
+		const onError = (event: Event) => {
+			const error =
+				(event as RTCErrorEvent).error ?? new Error("Data channel error");
+			this.logger.warn("[WebRTC] dataChannel:error", {
+				label: channel.label,
+				id: channel.id,
+				error,
+			});
+			this.callbacks.onError?.(error, channel);
+		};
+		// Consumers may also use onmessage/onclose without replacing our listeners.
+		channel.addEventListener("open", onOpen);
+		channel.addEventListener("close", onClose);
+		channel.addEventListener("message", onMessage);
+		channel.addEventListener("error", onError);
 	}
 
 	createDataChannel(
@@ -144,6 +181,7 @@ export class WebRTC {
 	async waitForIceGatheringComplete(
 		timeoutMs: number = WebRTC.ICE_GATHERING_TIMEOUT_MS,
 	): Promise<void> {
+		validateIceTimeout(timeoutMs);
 		if (this.closed) throw new Error("Peer connection is closed");
 		if (this.pc.iceGatheringState === "complete") {
 			return;
@@ -179,7 +217,7 @@ export class WebRTC {
 
 			timeoutId = setTimeout(() => {
 				cleanup();
-				reject(new Error("ICE gathering timed out"));
+				reject(new DOMException("ICE gathering timed out", "TimeoutError"));
 			}, timeoutMs);
 
 			this.pc.addEventListener(
@@ -193,11 +231,13 @@ export class WebRTC {
 		options?: RTCOfferOptions,
 		timeoutMs?: number,
 	): Promise<RTCSessionDescriptionInit> {
+		validateIceTimeout(timeoutMs ?? WebRTC.ICE_GATHERING_TIMEOUT_MS);
 		await this.createOffer(options);
 		try {
 			await this.waitForIceGatheringComplete(timeoutMs);
 		} catch (error) {
-			if (this.closed) throw error;
+			if (!(error instanceof DOMException) || error.name !== "TimeoutError")
+				throw error;
 			this.logger.warn("[WebRTC] createOfferWithGatheredIce:timeout", {
 				error: error instanceof Error ? error.message : String(error),
 				...this.getConnectionState(),
@@ -210,11 +250,13 @@ export class WebRTC {
 		options?: RTCAnswerOptions,
 		timeoutMs?: number,
 	): Promise<RTCSessionDescriptionInit> {
+		validateIceTimeout(timeoutMs ?? WebRTC.ICE_GATHERING_TIMEOUT_MS);
 		await this.createAnswer(options);
 		try {
 			await this.waitForIceGatheringComplete(timeoutMs);
 		} catch (error) {
-			if (this.closed) throw error;
+			if (!(error instanceof DOMException) || error.name !== "TimeoutError")
+				throw error;
 			this.logger.warn("[WebRTC] createAnswerWithGatheredIce:timeout", {
 				error: error instanceof Error ? error.message : String(error),
 				...this.getConnectionState(),
@@ -261,8 +303,7 @@ export class WebRTC {
 		);
 	}
 
-	async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
-		if (!candidate.candidate) return;
+	async addIceCandidate(candidate?: RTCIceCandidateInit | null): Promise<void> {
 		await this.pc.addIceCandidate(candidate);
 	}
 
@@ -285,6 +326,7 @@ export class WebRTC {
 		}
 		this.dataChannels.clear();
 		this.pc.close();
+		this.logger.info("[WebRTC] closed", this.getConnectionState());
 	}
 
 	getDataChannel(label: string): RTCDataChannel | undefined {
@@ -301,6 +343,14 @@ export class WebRTC {
 			type: localDescription.type,
 			sdp: localDescription.sdp ?? undefined,
 		};
+	}
+}
+
+function validateIceTimeout(timeoutMs: number): void {
+	if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 2 ** 31 - 1) {
+		throw new RangeError(
+			"ICE timeout must be between 0 and 2147483647 milliseconds",
+		);
 	}
 }
 

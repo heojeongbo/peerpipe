@@ -3,7 +3,7 @@
 Pion data-channel pumps. The package name is `peerpipe`.
 
 ```sh
-go get github.com/heojeongbo/peerpipe/go@v0.2.0
+go get github.com/heojeongbo/peerpipe/go@v0.3.0
 ```
 
 ```go
@@ -58,7 +58,54 @@ best-effort threshold, not a strict allocation bound: one payload may cross it.
 A congestion drop is not an error. This is a telemetry policy, not guaranteed
 command delivery. Applications needing acknowledgments implement them above it.
 A nil logger is silent; supply `*slog.Logger` to observe lifecycle and errors.
+`OnDrop func(bytes int)` observes each congestion-dropped encoded payload, after
+compression. It runs synchronously with Encode; do not reenter the source push
+callback or wait for `Done` from it. Before-open values are separate and are
+reported in lifecycle logs.
 
+## Sending directly
+
+```go
+sent, err := peerpipe.TrySend(channel, payload, queueLimit)
+switch {
+case err != nil:
+    // The native Send failed: report or stop according to application policy.
+case !sent:
+    // Congestion discarded the payload: count it or retry from the owner.
+default:
+    // The native sender accepted it; this is not a remote acknowledgment.
+}
+```
+
+## Logging
+
+Pass the logger belonging to the operation and the same context to `Open`.
+The library uses `InfoContext` / `WarnContext`, preserving values such as trace
+correlation even during cancellation and cleanup. It adds `component=peerpipe`
+and `label`; the application supplies session or request identity via its logger.
+There is no global logger or automatic stdout output.
+
+For an application already using go-app's OTx logging, the integration is:
+
+```go
+// log is github.com/lesomnus/otx/log, configured by the host application.
+channel, err := peerpipe.Open(ctx, pc, peerpipe.Options[[]byte]{
+    Label: "updates",
+    Source: peerpipe.Pushed(subscribe),
+    Encode: func(v []byte, emit func([]byte)) error { emit(v); return nil },
+    Logger: log.From(ctx),
+})
+// Handle err. The owner closes channel and waits for channel.Done().
+```
+
+Created/open/closed and first accepted send are informational. Initialization,
+encoding, sending, and cleanup failures are warnings with an `error` field;
+encode/send records also identify the `operation`. Only the first congestion
+warning is emitted per pump, and shutdown records the reason, accepted payload
+count, congestion drop count, and before-open drop count. Replaced held values
+are released but are not counted as congestion drops. Payload contents are never
+logged by the library; application-provided labels and error messages remain the
+application's responsibility. Returning errors still belong to the caller to handle.
 
 ## Development
 

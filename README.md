@@ -18,7 +18,7 @@ creating a new peer; there is no hidden reconnect loop.
 ## Install
 
 ```sh
-go get github.com/heojeongbo/peerpipe/go@v0.2.0
+go get github.com/heojeongbo/peerpipe/go@v0.3.0
 npm install @heojeongbo/peerpipe
 ```
 
@@ -70,8 +70,14 @@ cleanup.
 
 ## Releases and migration
 
-Go uses tags such as `go/v0.2.0`, because its module lives in `go/`.
-TypeScript uses `ts/v0.2.0` tags and the version in `ts/package.json`.
+In Go v0.3.0, `TrySend` returns `(sent bool, err error)`. `false, nil` is a
+congestion drop; `true, nil` means the native sender accepted the payload, not
+that the remote application received it. Callers choose how to handle a drop.
+`Open` retains the telemetry drop policy and can report drops via `OnDrop`.
+See [logging and ownership](go/README.md#logging) before integrating a pump.
+
+Go uses tags such as `go/v0.3.0`, because its module lives in `go/`.
+TypeScript uses `ts/v0.3.0` tags and the version in `ts/package.json`.
 The packages can advance independently; changes to the shared wire contract
 must pass the combined E2E. See [Go's subdirectory tagging rules](https://go.dev/doc/modules/managing-source).
 
@@ -87,10 +93,19 @@ and test that exact artifact in consumers before publishing it:
 npm --prefix ts run prepublishOnly
 (cd ts && npm pack --pack-destination ..)
 # Install the generated tarball in consumers and run their integration tests.
-npm publish ./heojeongbo-peerpipe-0.2.0.tgz --access public
+npm publish ./heojeongbo-peerpipe-0.3.0.tgz --access public
 ```
 
 `prepack` builds JavaScript and declarations. Publishing an existing tarball
 uses those packed files, so the type and unit checks above must already pass.
-Keep npm authentication outside the repository. Push the corresponding package
+Keep npm authentication outside version control. Push the corresponding package
 tag from the validated commit; Go consumers resolve the module via `go/vX.Y.Z`.
+
+## Design reference
+
+The separation between transport and application policy, explicit cleanup, and
+observable failures follows the approach demonstrated in
+[go-app's design](https://github.com/lesomnus/go-app/blob/kind/server/docs/DESIGN.md)
+and [limiter](https://github.com/lesomnus/go-app/blob/kind/server/internal/grpcx/limit.go).
+Peerpipe uses standard `slog` and caller-supplied callbacks; the host owns its
+logging exporters, signaling protocol, and application schema.

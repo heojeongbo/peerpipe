@@ -17,15 +17,19 @@ func (p Policy) BufferLimit() uint64 {
 	return p.MaxBufferedAmount
 }
 
-// TrySend discards a payload when the queue is already over limit. A discard is
-// not an error. Reliable SCTP delivery does not override this application policy.
+// TrySend returns (true, nil) when Send accepts a payload, (false, nil) when
+// congestion drops it, or (false, err) when Send fails. Acceptance does not mean
+// remote delivery. Reliable SCTP does not override the congestion policy.
 // Callers serialize sends when sharing the same sender. Zero uses the default.
-func TrySend(dc BufferedSender, payload []byte, limit uint64) error {
+func TrySend(dc BufferedSender, payload []byte, limit uint64) (sent bool, err error) {
 	if limit == 0 {
 		limit = DefaultMaxBufferedAmount
 	}
 	if dc.BufferedAmount() > limit {
-		return nil
+		return false, nil
 	}
-	return dc.Send(payload)
+	if err := dc.Send(payload); err != nil {
+		return false, err
+	}
+	return true, nil
 }

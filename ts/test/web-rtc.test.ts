@@ -106,16 +106,25 @@ describe("WebRTC ICE gathering helpers", () => {
 	});
 });
 
-/** Just enough of an RTCDataChannel for WebRTC to hang its handlers on. */
-type FakeDataChannel = {
-	label: string;
-	onopen: (() => void) | null;
-	onclose: (() => void) | null;
-	onmessage: ((event: MessageEvent) => void) | null;
-};
-
+/** EventTarget keeps the consumer's property handlers separate from listeners. */
+class FakeDataChannel extends EventTarget {
+	onclose: (() => void) | null = null;
+	onmessage: ((event: MessageEvent) => void) | null = null;
+	constructor(readonly label: string) {
+		super();
+	}
+	close() {
+		this.dispatchEvent(new Event("close"));
+		this.onclose?.();
+	}
+	message(data: unknown) {
+		const event = new MessageEvent("message", { data });
+		this.dispatchEvent(event);
+		this.onmessage?.(event);
+	}
+}
 function fakeDataChannel(label: string): FakeDataChannel {
-	return { label, onopen: null, onclose: null, onmessage: null };
+	return new FakeDataChannel(label);
 }
 
 describe("WebRTC data channel map", () => {
@@ -131,27 +140,25 @@ describe("WebRTC data channel map", () => {
 	});
 
 	it("keeps a re-opened channel when the one it replaced closes late", () => {
-		// Regression: the close handler deleted by label, so an old robot/teleop
-		// finishing its close after the re-granted one arrived dropped the live
-		// channel from the map, and the session reported teleop as gone.
+		// A replaced subscription may finish closing after its replacement opens.
 		const onDataChannelClose = vi.fn();
 		const webRTC = WebRTC.create(undefined, { onDataChannelClose });
 		const pc = (webRTC as unknown as { pc: FakeRTCPeerConnection }).pc;
 
-		const replaced = fakeDataChannel("robot/teleop");
-		const live = fakeDataChannel("robot/teleop");
+		const replaced = fakeDataChannel("updates");
+		const live = fakeDataChannel("updates");
 		pc.ondatachannel?.({ channel: replaced } as unknown as RTCDataChannelEvent);
 		pc.ondatachannel?.({ channel: live } as unknown as RTCDataChannelEvent);
 
-		replaced.onclose?.();
+		replaced.close();
 
-		expect(webRTC.getDataChannel("robot/teleop")).toBe(live);
-		// Still reported: the requester reads the map to decide the grant is kept.
+		expect(webRTC.getDataChannel("updates")).toBe(live);
+		// Still reported: consumers receive the actual channel that closed.
 		expect(onDataChannelClose).toHaveBeenCalledWith(replaced);
 
-		live.onclose?.();
+		live.close();
 
-		expect(webRTC.getDataChannel("robot/teleop")).toBeUndefined();
+		expect(webRTC.getDataChannel("updates")).toBeUndefined();
 	});
 });
 
@@ -215,5 +222,174 @@ describe("gathered descriptions during shutdown", () => {
 		await Promise.resolve();
 		peer.close();
 		await expect(pending).rejects.toThrow("Peer connection is closed");
+	});
+});
+
+describe("transport contracts", () => {
+	afterEach(() => vi.unstubAllGlobals());
+
+	it("forwards regular candidates and every native end-of-candidates form", async () => {
+		const add = vi.fn().mockResolvedValue(undefined);
+		vi.stubGlobal(
+			"RTCPeerConnection",
+			class extends FakeRTCPeerConnection {
+				addIceCandidate = add;
+			},
+		);
+		const peer = WebRTC.create();
+		const candidate = { candidate: "candidate:example", sdpMid: "0" };
+		const end = { candidate: "", sdpMid: "0" };
+		await peer.addIceCandidate(candidate);
+		await peer.addIceCandidate(end);
+		await peer.addIceCandidate({});
+		await peer.addIceCandidate(null);
+		await peer.addIceCandidate();
+		expect(add.mock.calls).toEqual([
+			[candidate],
+			[end],
+			[{}],
+			[null],
+			[undefined],
+		]);
+		peer.close();
+	});
+
+	it("closes a partially configured peer and preserves the creation error", () => {
+		const failure = new TypeError("invalid transceiver");
+		const close = vi.fn();
+		const add = vi
+			.fn()
+			.mockImplementationOnce(() => ({}))
+			.mockImplementationOnce(() => {
+				throw failure;
+			});
+		const logger = { info: vi.fn(), warn: vi.fn() };
+		vi.stubGlobal(
+			"RTCPeerConnection",
+			class extends FakeRTCPeerConnection {
+				addTransceiver = add;
+				close = close;
+			},
+		);
+		expect(() =>
+			WebRTC.create({
+				logger,
+				transceivers: [{ kind: "audio" }, { kind: "invalid" }],
+			}),
+		).toThrow(failure);
+		expect(add).toHaveBeenCalledTimes(2);
+		expect(close).toHaveBeenCalledTimes(1);
+		expect(logger.warn).toHaveBeenCalledWith("[WebRTC] create:failed", {
+			error: failure,
+		});
+	});
+
+	it("delivers native channel errors with their channel and the latest callback", () => {
+		vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+		const old = vi.fn();
+		const onError = vi.fn();
+		const logger = { info: vi.fn(), warn: vi.fn() };
+		const peer = WebRTC.create({ logger }, { onError: old });
+		const pc = (peer as unknown as { pc: FakeRTCPeerConnection }).pc;
+		const channel = fakeDataChannel("updates");
+		pc.ondatachannel?.({ channel } as unknown as RTCDataChannelEvent);
+		peer.updateCallbacks({ onError });
+		const error = new Error("transport failed");
+		const event = new Event("error");
+		Object.defineProperty(event, "error", { value: error });
+		channel.dispatchEvent(event);
+		expect(old).not.toHaveBeenCalled();
+		expect(onError).toHaveBeenCalledWith(error, channel);
+		expect(logger.warn).toHaveBeenCalledWith("[WebRTC] dataChannel:error", {
+			label: "updates",
+			id: undefined,
+			error,
+		});
+		channel.close();
+		channel.dispatchEvent(event);
+		expect(onError).toHaveBeenCalledTimes(1);
+		peer.close();
+	});
+
+	it("keeps method failures in their promise rather than reporting them twice", async () => {
+		const failure = new Error("invalid candidate");
+		vi.stubGlobal(
+			"RTCPeerConnection",
+			class extends FakeRTCPeerConnection {
+				async addIceCandidate() {
+					throw failure;
+				}
+			},
+		);
+		const onError = vi.fn();
+		const peer = WebRTC.create(undefined, { onError });
+		await expect(peer.addIceCandidate({ candidate: "bad" })).rejects.toBe(
+			failure,
+		);
+		expect(onError).not.toHaveBeenCalled();
+		peer.close();
+	});
+
+	it("composes consumer property handlers with library delivery and cleanup", () => {
+		vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+		const onDataChannelMessage = vi.fn();
+		const onDataChannelClose = vi.fn();
+		const logger = { info: vi.fn(), warn: vi.fn() };
+		const peer = WebRTC.create(
+			{ logger },
+			{ onDataChannelMessage, onDataChannelClose },
+		);
+		const pc = (peer as unknown as { pc: FakeRTCPeerConnection }).pc;
+		const channel = fakeDataChannel("updates");
+		pc.ondatachannel?.({ channel } as unknown as RTCDataChannelEvent);
+		channel.onmessage = vi.fn();
+		channel.onclose = vi.fn();
+		channel.message("private-payload");
+		expect(onDataChannelMessage).toHaveBeenCalledWith(
+			"private-payload",
+			channel,
+		);
+		expect(channel.onmessage).toHaveBeenCalledTimes(1);
+		channel.close();
+		expect(onDataChannelClose).toHaveBeenCalledWith(channel);
+		expect(channel.onclose).toHaveBeenCalledTimes(1);
+		expect(peer.getDataChannel("updates")).toBeUndefined();
+		channel.message("late");
+		expect(onDataChannelMessage).toHaveBeenCalledTimes(1);
+		peer.close();
+		peer.close();
+		expect(
+			logger.info.mock.calls.filter(
+				([message]) => message === "[WebRTC] closed",
+			),
+		).toHaveLength(1);
+		expect(JSON.stringify(logger.info.mock.calls)).not.toContain(
+			"private-payload",
+		);
+	});
+});
+
+describe("ICE timeout validation", () => {
+	beforeEach(() => vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection));
+	afterEach(() => vi.unstubAllGlobals());
+	it.each([
+		-1,
+		NaN,
+		Infinity,
+		2 ** 31,
+	])("rejects invalid timeout %s without starting negotiation", async (timeout) => {
+		const peer = WebRTC.create();
+		const pc = (peer as unknown as { pc: FakeRTCPeerConnection }).pc;
+		await expect(
+			peer.waitForIceGatheringComplete(timeout),
+		).rejects.toBeInstanceOf(RangeError);
+		await expect(
+			peer.createOfferWithGatheredIce(undefined, timeout),
+		).rejects.toBeInstanceOf(RangeError);
+		await expect(
+			peer.createAnswerWithGatheredIce(undefined, timeout),
+		).rejects.toBeInstanceOf(RangeError);
+		expect(pc.localDescription).toBeNull();
+		peer.close();
 	});
 });
